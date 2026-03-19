@@ -33,6 +33,7 @@ function HeliosConsole({ jwtToken }) {
   const [imageB64, setImageB64] = useState('')
   const [imagePreview, setImagePreview] = useState('')
   const [imageTransition, setImageTransition] = useState('cut')
+  const [imageInfo, setImageInfo] = useState('')
   const [lastCommandStatus, setLastCommandStatus] = useState('')
   const [lastCommandError, setLastCommandError] = useState('')
   const videoShellRef = useRef(null)
@@ -97,22 +98,49 @@ function HeliosConsole({ jwtToken }) {
   const handleImageUpload = (event) => {
     const file = event.target.files?.[0]
     if (!file) return
+    setImageInfo('')
     const reader = new FileReader()
     reader.onload = () => {
       const result = reader.result
       if (typeof result !== 'string') return
       const img = new Image()
       img.onload = () => {
+        const MAX_BYTES = 60 * 1024
+        const MAX_DIM = 1024
+        const scale = Math.min(1, MAX_DIM / Math.max(img.width, img.height))
         const canvas = document.createElement('canvas')
-        canvas.width = img.width
-        canvas.height = img.height
+        canvas.width = Math.max(1, Math.round(img.width * scale))
+        canvas.height = Math.max(1, Math.round(img.height * scale))
         const ctx = canvas.getContext('2d')
         if (!ctx) return
-        ctx.drawImage(img, 0, 0)
-        const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.95)
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+
+        let quality = 0.9
+        let jpegDataUrl = canvas.toDataURL('image/jpeg', quality)
+        let byteSize = Math.ceil((jpegDataUrl.length * 3) / 4)
+
+        while (byteSize > MAX_BYTES && quality > 0.4) {
+          quality -= 0.1
+          jpegDataUrl = canvas.toDataURL('image/jpeg', quality)
+          byteSize = Math.ceil((jpegDataUrl.length * 3) / 4)
+        }
+
+        if (byteSize > MAX_BYTES) {
+          const scale2 = Math.sqrt(MAX_BYTES / byteSize)
+          canvas.width = Math.max(1, Math.round(canvas.width * scale2))
+          canvas.height = Math.max(1, Math.round(canvas.height * scale2))
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+          quality = 0.8
+          jpegDataUrl = canvas.toDataURL('image/jpeg', quality)
+          byteSize = Math.ceil((jpegDataUrl.length * 3) / 4)
+        }
+
         setImagePreview(jpegDataUrl)
         const stripped = jpegDataUrl.replace(/^data:image\/[^;]+;base64,/, '')
         setImageB64(stripped)
+        setImageInfo(
+          `Compressed to ${(byteSize / 1024).toFixed(1)} KB (${canvas.width}×${canvas.height})`
+        )
       }
       img.src = result
     }
@@ -297,6 +325,7 @@ function HeliosConsole({ jwtToken }) {
             ) : (
               <p className="muted">No image selected.</p>
             )}
+            {imageInfo ? <p className="muted">{imageInfo}</p> : null}
             <div className="button-row">
               <select
                 className="input"
