@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactorProvider,
   ReactorView,
@@ -30,6 +30,16 @@ function HeliosConsole({ jwtToken }) {
   const [seed, setSeed] = useState('42')
   const [modelState, setModelState] = useState(null)
   const [events, setEvents] = useState([])
+  const [imageB64, setImageB64] = useState('')
+  const [imagePreview, setImagePreview] = useState('')
+  const [imageTransition, setImageTransition] = useState('cut')
+  const [lastCommandStatus, setLastCommandStatus] = useState('')
+  const [lastCommandError, setLastCommandError] = useState('')
+  const videoShellRef = useRef(null)
+  const [recorder, setRecorder] = useState(null)
+  const [isRecording, setIsRecording] = useState(false)
+  const [recordingError, setRecordingError] = useState('')
+  const [downloadUrl, setDownloadUrl] = useState('')
 
   const statusLabel = useMemo(() => {
     if (status === 'disconnected') return 'Disconnected'
@@ -61,13 +71,113 @@ function HeliosConsole({ jwtToken }) {
     }
   })
 
+  useEffect(() => {
+    return () => {
+      if (downloadUrl) URL.revokeObjectURL(downloadUrl)
+    }
+  }, [downloadUrl])
+
   const handleConnect = async () => {
     if (!jwtToken) return
     await connect(jwtToken)
   }
 
   const handleCommand = async (command, data = {}) => {
-    await sendCommand(command, data)
+    setLastCommandError('')
+    setLastCommandStatus(`Sending ${command}...`)
+    try {
+      await sendCommand(command, data)
+      setLastCommandStatus(`${command} sent`)
+    } catch (error) {
+      setLastCommandError(error?.message || 'Command failed')
+      setLastCommandStatus('')
+    }
+  }
+
+  const handleImageUpload = (event) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = reader.result
+      if (typeof result !== 'string') return
+      const img = new Image()
+      img.onload = () => {
+        const canvas = document.createElement('canvas')
+        canvas.width = img.width
+        canvas.height = img.height
+        const ctx = canvas.getContext('2d')
+        if (!ctx) return
+        ctx.drawImage(img, 0, 0)
+        const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.95)
+        setImagePreview(jpegDataUrl)
+        const stripped = jpegDataUrl.replace(/^data:image\/[^;]+;base64,/, '')
+        setImageB64(stripped)
+      }
+      img.src = result
+    }
+    reader.readAsDataURL(file)
+  }
+
+  const getVideoElement = () => {
+    if (!videoShellRef.current) return null
+    return videoShellRef.current.querySelector('video')
+  }
+
+  const startRecording = () => {
+    setRecordingError('')
+    const videoElement = getVideoElement()
+    if (!videoElement) {
+      setRecordingError('Video element not ready yet.')
+      return
+    }
+    const stream =
+      videoElement.captureStream?.() || videoElement.mozCaptureStream?.()
+    if (!stream) {
+      setRecordingError('Recording is not supported in this browser.')
+      return
+    }
+
+    try {
+      const options = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+        ? { mimeType: 'video/webm;codecs=vp9' }
+        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
+          ? { mimeType: 'video/webm;codecs=vp8' }
+          : { mimeType: 'video/webm' }
+
+      const mediaRecorder = new MediaRecorder(stream, options)
+      const chunks = []
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          chunks.push(event.data)
+        }
+      }
+      mediaRecorder.onstop = () => {
+        if (downloadUrl) URL.revokeObjectURL(downloadUrl)
+        const blob = new Blob(chunks, { type: 'video/webm' })
+        const url = URL.createObjectURL(blob)
+        setDownloadUrl(url)
+      }
+      mediaRecorder.start(1000)
+      setRecorder(mediaRecorder)
+      setIsRecording(true)
+    } catch (error) {
+      setRecordingError(error?.message || 'Failed to start recording.')
+    }
+  }
+
+  const stopRecording = () => {
+    if (!recorder) return
+    if (recorder.state !== 'inactive') recorder.stop()
+    setIsRecording(false)
+  }
+
+  const downloadRecording = () => {
+    if (!downloadUrl) return
+    const link = document.createElement('a')
+    link.href = downloadUrl
+    link.download = `helios-recording-${Date.now()}.webm`
+    link.click()
   }
 
   const renderState = () => {
@@ -173,6 +283,60 @@ function HeliosConsole({ jwtToken }) {
             </button>
           </div>
           <div>
+            <label className="label">Reference Image</label>
+            <input
+              className="input"
+              type="file"
+              accept="image/*"
+              onChange={handleImageUpload}
+            />
+            {imagePreview ? (
+              <div className="image-preview">
+                <img src={imagePreview} alt="Reference preview" />
+              </div>
+            ) : (
+              <p className="muted">No image selected.</p>
+            )}
+            <div className="button-row">
+              <select
+                className="input"
+                value={imageTransition}
+                onChange={(event) => setImageTransition(event.target.value)}
+              >
+                <option value="cut">cut</option>
+                <option value="blend">blend</option>
+              </select>
+              <button
+                className="btn subtle"
+                onClick={() =>
+                  handleCommand('set_image', {
+                    image_b64: imageB64,
+                    transition: imageTransition,
+                  })
+                }
+                disabled={!imageB64 || status !== 'ready'}
+              >
+                Set Image
+              </button>
+              <button
+                className="btn ghost"
+                onClick={() => handleCommand('clear_image', {})}
+                disabled={status !== 'ready'}
+              >
+                Clear Image
+              </button>
+            </div>
+            {status !== 'ready' ? (
+              <p className="muted">Connect first — image commands need Ready.</p>
+            ) : null}
+            {lastCommandStatus ? (
+              <p className="muted">{lastCommandStatus}</p>
+            ) : null}
+            {lastCommandError ? (
+              <div className="error-card">{lastCommandError}</div>
+            ) : null}
+          </div>
+          <div>
             <label className="label">Schedule Prompt</label>
             <input
               className="input"
@@ -244,12 +408,31 @@ function HeliosConsole({ jwtToken }) {
           </div>
           <p className="muted">Helios outputs 33-frame chunks.</p>
         </div>
-        <div className="video-shell">
+        <div className="video-shell" ref={videoShellRef}>
           <ReactorView className="video" videoObjectFit="cover" muted />
-          <div className="video-overlay">
-            <span>{statusLabel}</span>
-          </div>
         </div>
+        <div className="record-row">
+          <button
+            className={`btn ${isRecording ? 'danger' : ''}`}
+            onClick={isRecording ? stopRecording : startRecording}
+            disabled={status === 'disconnected'}
+          >
+            {isRecording ? 'Stop Recording' : 'Record'}
+          </button>
+          <button
+            className="btn ghost"
+            onClick={downloadRecording}
+            disabled={!downloadUrl}
+          >
+            Save Recording
+          </button>
+          <span className="muted">
+            {isRecording ? 'Recording…' : 'Ready to record.'}
+          </span>
+        </div>
+        {recordingError ? (
+          <div className="error-card">{recordingError}</div>
+        ) : null}
         <div className="hint">
           Prompt changes apply at the next chunk boundary. Expect a short delay.
         </div>
