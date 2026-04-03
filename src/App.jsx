@@ -499,7 +499,6 @@ function App() {
         <div className="steps">
           <h2>Steps</h2>
           <ol>
-            <li>Set <code>VITE_REACTOR_API_KEY</code> and <code>VITE_GEMINI_API_KEY</code> in <code>.env.local</code>.</li>
             <li>Upload or capture a photo.</li>
             <li>Connect Helios and wait for ready.</li>
             <li>Watch the 25s animation or record it.</li>
