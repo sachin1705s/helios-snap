@@ -110,9 +110,10 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
     if (inFlightRef.current) return
     inFlightRef.current = true
     onError?.('')
-    onProgress?.('Setting image...')
+    onProgress?.('Preparing stream...')
     try {
       await sendCommand('reset')
+      await sendCommand('schedule_prompt', { prompt: ANIMATE_PROMPT, chunk: 0 })
       await sendCommand('set_image', {
         image_b64: pendingImageRef.current,
         transition: 'cut',
@@ -127,8 +128,16 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
         }, 1500)
       })
       onProgress?.('Starting stream...')
-      await sendCommand('set_prompt', { prompt: ANIMATE_PROMPT })
       await sendCommand('start')
+      // Re-apply image shortly after start to reinforce conditioning.
+      window.setTimeout(() => {
+        if (pendingImageRef.current && status === 'ready') {
+          sendCommand('set_image', {
+            image_b64: pendingImageRef.current,
+            transition: 'cut',
+          })
+        }
+      }, 1200)
       onProgress?.('Streaming (60s)...')
       clearDisconnectTimer()
       disconnectTimerRef.current = window.setTimeout(() => {
