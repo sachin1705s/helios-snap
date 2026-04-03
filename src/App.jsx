@@ -326,7 +326,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [apiKey])
+  }, [envApiKey, isDev])
 
   const generateGhibli = useCallback(
     async (imageDataUrl) => {
@@ -512,7 +512,7 @@ function App() {
             <li>Watch the 25s animation or record it.</li>
           </ol>
         </div>
-        {!apiKey ? (
+        {isDev && !envApiKey ? (
           <div className="error-card">Missing VITE_REACTOR_API_KEY.</div>
         ) : null}
         {!geminiKey ? (
