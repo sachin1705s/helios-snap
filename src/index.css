@@ -1,17 +1,17 @@
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@400;600;700&family=Source+Sans+3:wght@400;500;600&display=swap');
 
 :root {
-  --bg: #070b14;
-  --bg-glow: radial-gradient(circle at top right, rgba(14, 165, 233, 0.2), transparent 45%);
-  --surface: rgba(12, 17, 28, 0.86);
-  --border-soft: rgba(148, 163, 184, 0.18);
-  --text-primary: #f8fafc;
-  --text-secondary: #cbd5f5;
-  --text-tertiary: #94a3b8;
-  --accent: #38bdf8;
-  --shadow-soft: 0 30px 80px rgba(5, 8, 20, 0.55);
-  --font-sans: 'Space Grotesk', system-ui, sans-serif;
-  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --bg: #f3ead9;
+  --surface: #fff7e8;
+  --surface-strong: #f7e8cf;
+  --border: #d9c9ad;
+  --text-primary: #3a2f1f;
+  --text-secondary: #6b5b46;
+  --accent: #b9702b;
+  --accent-strong: #8a4b1c;
+  --shadow: 0 24px 60px rgba(58, 47, 31, 0.12);
+  --font-sans: 'Source Sans 3', ui-sans-serif, system-ui, sans-serif;
+  --font-serif: 'Fraunces', serif;
 }
 
 * {
@@ -22,7 +22,7 @@ body {
   margin: 0;
   min-height: 100vh;
   font-family: var(--font-sans);
-  background: var(--bg-glow), var(--bg);
+  background: radial-gradient(circle at top, #fff2dd, transparent 45%), var(--bg);
   color: var(--text-primary);
 }
 
@@ -30,16 +30,13 @@ body {
   min-height: 100vh;
 }
 
-a {
-  color: inherit;
-}
-
-code {
-  font-family: var(--font-mono);
-}
-
 button,
 input,
 textarea {
   font-family: inherit;
+}
+
+img {
+  max-width: 100%;
+  display: block;
 }
