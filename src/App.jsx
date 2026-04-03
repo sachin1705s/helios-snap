@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ReactorProvider, ReactorView, useReactor } from '@reactor-team/js-sdk'
+import {
+  ReactorProvider,
+  ReactorView,
+  useReactor,
+  useReactorMessage,
+} from '@reactor-team/js-sdk'
 import './App.css'
 
 const ANIMATE_PROMPT = 'animate it'
@@ -65,6 +70,17 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
   const disconnectTimerRef = useRef(null)
   const pendingImageRef = useRef('')
   const inFlightRef = useRef(false)
+  const waitForImageSetRef = useRef(null)
+
+  useReactorMessage((msg) => {
+    if (!msg || typeof msg !== 'object') return
+    if (msg.type === 'event' && msg.data?.event === 'image_set') {
+      if (waitForImageSetRef.current) {
+        waitForImageSetRef.current()
+        waitForImageSetRef.current = null
+      }
+    }
+  })
   const [recorder, setRecorder] = useState(null)
   const [isRecording, setIsRecording] = useState(false)
   const [recordingError, setRecordingError] = useState('')
@@ -94,13 +110,23 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
     if (inFlightRef.current) return
     inFlightRef.current = true
     onError?.('')
-    onProgress?.('Animating...')
+    onProgress?.('Setting image...')
     try {
       await sendCommand('reset')
       await sendCommand('set_image', {
         image_b64: pendingImageRef.current,
         transition: 'cut',
       })
+      await new Promise((resolve) => {
+        waitForImageSetRef.current = resolve
+        window.setTimeout(() => {
+          if (waitForImageSetRef.current === resolve) {
+            waitForImageSetRef.current = null
+            resolve()
+          }
+        }, 1500)
+      })
+      onProgress?.('Starting stream...')
       await sendCommand('set_prompt', { prompt: ANIMATE_PROMPT })
       await sendCommand('start')
       onProgress?.('Streaming (60s)...')
