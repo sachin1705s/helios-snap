@@ -63,6 +63,8 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
   const [isFullscreen, setIsFullscreen] = useState(false)
   const lastAnimatedRef = useRef('')
   const disconnectTimerRef = useRef(null)
+  const pendingImageRef = useRef('')
+  const inFlightRef = useRef(false)
   const [recorder, setRecorder] = useState(null)
   const [isRecording, setIsRecording] = useState(false)
   const [recordingError, setRecordingError] = useState('')
@@ -81,7 +83,7 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
   }
 
   const handleAnimate = async () => {
-    if (!heliosImageB64) {
+    if (!pendingImageRef.current) {
       onError?.('Upload an image first.')
       return
     }
@@ -89,10 +91,16 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
       onError?.('Connect Helios and wait for Ready.')
       return
     }
+    if (inFlightRef.current) return
+    inFlightRef.current = true
     onError?.('')
     onProgress?.('Animating...')
     try {
-      await sendCommand('set_image', { image_b64: heliosImageB64, transition: 'cut' })
+      await sendCommand('reset')
+      await sendCommand('set_image', {
+        image_b64: pendingImageRef.current,
+        transition: 'cut',
+      })
       await sendCommand('set_prompt', { prompt: ANIMATE_PROMPT })
       await sendCommand('start')
       onProgress?.('Streaming (60s)...')
@@ -103,16 +111,26 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
       }, 60000)
     } catch (err) {
       onError?.(err?.message || 'Failed to animate.')
+    } finally {
+      inFlightRef.current = false
     }
   }
 
   useEffect(() => {
-    if (status !== 'ready') return
     if (!heliosImageB64) return
     if (lastAnimatedRef.current === heliosImageB64) return
     lastAnimatedRef.current = heliosImageB64
-    handleAnimate()
+    pendingImageRef.current = heliosImageB64
+    if (status === 'ready') {
+      handleAnimate()
+    }
   }, [heliosImageB64, status])
+
+  useEffect(() => {
+    if (status === 'ready' && pendingImageRef.current) {
+      handleAnimate()
+    }
+  }, [status])
 
   useEffect(() => {
     const handleFullscreenChange = () => {
