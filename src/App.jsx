@@ -281,6 +281,7 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
 function App() {
   const envApiKey = import.meta.env.VITE_REACTOR_API_KEY
   const geminiKey = import.meta.env.VITE_GEMINI_API_KEY
+  const isDev = import.meta.env.DEV
   const [jwtToken, setJwtToken] = useState(null)
   const [tokenError, setTokenError] = useState('')
   const [uploadPreview, setUploadPreview] = useState('')
@@ -293,13 +294,21 @@ function App() {
   const cameraVideoRef = useRef(null)
   const cameraStreamRef = useRef(null)
 
-  const apiKey = envApiKey
   useEffect(() => {
-    if (!apiKey) return
+    const useClientKey = isDev && envApiKey
+    if (!useClientKey && !isDev) {
+      // Production/Vercel: serverless token endpoint handles auth.
+    } else if (!useClientKey && isDev) {
+      setTokenError('Missing VITE_REACTOR_API_KEY for local dev.')
+      return
+    }
     let cancelled = false
     setTokenError('')
-    fetch('/api/token', {
+    const endpoint = useClientKey ? '/reactor/tokens' : '/api/token'
+    const headers = useClientKey ? { 'Reactor-API-Key': envApiKey } : undefined
+    fetch(endpoint, {
       method: 'POST',
+      headers,
     })
       .then(async (response) => {
         if (!response.ok) {
@@ -544,9 +553,7 @@ function App() {
       </div>
 
       <section className="panel stream-panel large">
-        {!apiKey ? (
-          <div className="muted">Add your Reactor API key to connect Helios.</div>
-        ) : !jwtToken ? (
+        {!jwtToken ? (
           <div className="muted">Fetching Reactor token...</div>
         ) : (
           <ReactorProvider
