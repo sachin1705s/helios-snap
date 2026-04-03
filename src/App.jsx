@@ -298,9 +298,8 @@ function App() {
     if (!apiKey) return
     let cancelled = false
     setTokenError('')
-    fetch('/reactor/tokens', {
+    fetch('/api/token', {
       method: 'POST',
-      headers: { 'Reactor-API-Key': apiKey },
     })
       .then(async (response) => {
         if (!response.ok) {
