@@ -95,12 +95,12 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
       await sendCommand('set_image', { image_b64: heliosImageB64, transition: 'cut' })
       await sendCommand('set_prompt', { prompt: ANIMATE_PROMPT })
       await sendCommand('start')
-      onProgress?.('Streaming (25s)...')
+      onProgress?.('Streaming (60s)...')
       clearDisconnectTimer()
       disconnectTimerRef.current = window.setTimeout(() => {
         disconnect()
         onProgress?.('Disconnected.')
-      }, 25000)
+      }, 60000)
     } catch (err) {
       onError?.(err?.message || 'Failed to animate.')
     }
@@ -247,9 +247,6 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
           disabled={status === 'disconnected'}
         >
           Disconnect
-        </button>
-        <button className="btn primary" onClick={handleAnimate}>
-          Animate It
         </button>
         <button className="btn ghost" onClick={toggleFullscreen}>
           {isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
