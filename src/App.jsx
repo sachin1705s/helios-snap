@@ -53,22 +53,28 @@ async function dataUrlToImage(dataUrl) {
   return img
 }
 
-function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
-  const { status, connect, disconnect, sendCommand, lastError } = useReactor(
+async function dataUrlToBlob(dataUrl) {
+  const response = await fetch(dataUrl)
+  return response.blob()
+}
+
+function HeliosSnap({ jwtToken, heliosImageFile, onProgress, onError }) {
+  const { status, connect, disconnect, sendCommand, uploadFile, lastError } = useReactor(
     (state) => ({
       status: state.status,
       connect: state.connect,
       disconnect: state.disconnect,
       sendCommand: state.sendCommand,
+      uploadFile: state.uploadFile,
       lastError: state.lastError,
     })
   )
 
   const videoShellRef = useRef(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
-  const lastAnimatedRef = useRef('')
+  const lastAnimatedRef = useRef(null)
   const disconnectTimerRef = useRef(null)
-  const pendingImageRef = useRef('')
+  const pendingImageRef = useRef(null)
   const inFlightRef = useRef(false)
   const waitForImageSetRef = useRef(null)
 
@@ -98,7 +104,7 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
     }
   }
 
-  const handleAnimate = async () => {
+  const handleAnimate = useCallback(async () => {
     if (!pendingImageRef.current) {
       onError?.('Upload an image first.')
       return
@@ -114,8 +120,9 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
     try {
       await sendCommand('reset')
       await sendCommand('schedule_prompt', { prompt: ANIMATE_PROMPT, chunk: 0 })
+      const imageRef = await uploadFile(pendingImageRef.current, { name: 'helios-frame.jpg' })
       await sendCommand('set_image', {
-        image_b64: pendingImageRef.current,
+        image: imageRef,
         transition: 'cut',
       })
       await new Promise((resolve) => {
@@ -133,7 +140,7 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
       window.setTimeout(() => {
         if (pendingImageRef.current && status === 'ready') {
           sendCommand('set_image', {
-            image_b64: pendingImageRef.current,
+            image: imageRef,
             transition: 'cut',
           })
         }
@@ -149,23 +156,23 @@ function HeliosSnap({ jwtToken, heliosImageB64, onProgress, onError }) {
     } finally {
       inFlightRef.current = false
     }
-  }
+  }, [disconnect, onError, onProgress, sendCommand, status, uploadFile])
 
   useEffect(() => {
-    if (!heliosImageB64) return
-    if (lastAnimatedRef.current === heliosImageB64) return
-    lastAnimatedRef.current = heliosImageB64
-    pendingImageRef.current = heliosImageB64
+    if (!heliosImageFile) return
+    if (lastAnimatedRef.current === heliosImageFile) return
+    lastAnimatedRef.current = heliosImageFile
+    pendingImageRef.current = heliosImageFile
     if (status === 'ready') {
       handleAnimate()
     }
-  }, [heliosImageB64, status])
+  }, [handleAnimate, heliosImageFile, status])
 
   useEffect(() => {
     if (status === 'ready' && pendingImageRef.current) {
       handleAnimate()
     }
-  }, [status])
+  }, [handleAnimate, status])
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -334,9 +341,8 @@ function App() {
   const isDev = import.meta.env.DEV
   const [jwtToken, setJwtToken] = useState(null)
   const [tokenError, setTokenError] = useState('')
-  const [uploadPreview, setUploadPreview] = useState('')
   const [ghibliPreview, setGhibliPreview] = useState('')
-  const [heliosImageB64, setHeliosImageB64] = useState('')
+  const [heliosImageFile, setHeliosImageFile] = useState(null)
   const [progress, setProgress] = useState('')
   const [error, setError] = useState('')
   const [cameraOn, setCameraOn] = useState(false)
@@ -344,16 +350,14 @@ function App() {
   const cameraVideoRef = useRef(null)
   const cameraStreamRef = useRef(null)
 
+  const missingLocalReactorKey = isDev && !envApiKey
+
   useEffect(() => {
     const useClientKey = isDev && envApiKey
-    if (!useClientKey && !isDev) {
-      // Production/Vercel: serverless token endpoint handles auth.
-    } else if (!useClientKey && isDev) {
-      setTokenError('Missing VITE_REACTOR_API_KEY for local dev.')
+    if (missingLocalReactorKey) {
       return
     }
     let cancelled = false
-    setTokenError('')
     const endpoint = useClientKey ? '/reactor/tokens' : '/api/token'
     const headers = useClientKey ? { 'Reactor-API-Key': envApiKey } : undefined
     fetch(endpoint, {
@@ -368,7 +372,10 @@ function App() {
         if (!data?.jwt) {
           throw new Error('Token response missing jwt')
         }
-        if (!cancelled) setJwtToken(data.jwt)
+        if (!cancelled) {
+          setTokenError('')
+          setJwtToken(data.jwt)
+        }
       })
       .catch((fetchError) => {
         if (!cancelled) setTokenError(fetchError?.message || 'Failed to fetch token')
@@ -376,7 +383,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [envApiKey, isDev])
+  }, [envApiKey, isDev, missingLocalReactorKey])
 
   const generateGhibli = useCallback(
     async (imageDataUrl) => {
@@ -387,8 +394,6 @@ function App() {
 
       setError('')
       setProgress('Generating Ghibli frame...')
-
-      setUploadPreview(imageDataUrl)
 
       const base64 = imageDataUrl.replace(/^data:image\/[^;]+;base64,/, '')
       const mimeTypeMatch = imageDataUrl.match(/^data:(image\/[^;]+);base64,/) || []
@@ -460,8 +465,8 @@ function App() {
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
 
       const { dataUrl: heliosDataUrl } = compressCanvasToJpeg(canvas)
-      const heliosB64 = heliosDataUrl.replace(/^data:image\/[^;]+;base64,/, '')
-      setHeliosImageB64(heliosB64)
+      const heliosBlob = await dataUrlToBlob(heliosDataUrl)
+      setHeliosImageFile(heliosBlob)
       setProgress('Ghibli frame ready.')
     },
     [geminiKey]
@@ -471,7 +476,7 @@ function App() {
     const file = event.target.files?.[0]
     if (!file) return
     setGhibliPreview('')
-    setHeliosImageB64('')
+    setHeliosImageFile(null)
     try {
       const fileDataUrl = await new Promise((resolve, reject) => {
         const reader = new FileReader()
@@ -543,7 +548,7 @@ function App() {
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
     const dataUrl = canvas.toDataURL('image/jpeg', 0.9)
     setGhibliPreview('')
-    setHeliosImageB64('')
+    setHeliosImageFile(null)
     await generateGhibli(dataUrl)
   }
 
@@ -562,7 +567,7 @@ function App() {
             <li>Watch the 25s animation or record it.</li>
           </ol>
         </div>
-        {isDev && !envApiKey ? (
+        {missingLocalReactorKey ? (
           <div className="error-card">Missing VITE_REACTOR_API_KEY.</div>
         ) : null}
         {!geminiKey ? (
@@ -614,7 +619,7 @@ function App() {
           >
             <HeliosSnap
               jwtToken={jwtToken}
-              heliosImageB64={heliosImageB64}
+              heliosImageFile={heliosImageFile}
               onProgress={(msg) => setProgress(msg || '')}
               onError={(msg) => setError(msg || '')}
             />

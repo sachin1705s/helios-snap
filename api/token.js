@@ -4,7 +4,7 @@ export default async function handler(req, res) {
     return
   }
 
-  const apiKey = process.env.REACTOR_API_KEY
+  const apiKey = globalThis.process?.env?.REACTOR_API_KEY
   if (!apiKey) {
     res.status(500).json({ error: 'Missing REACTOR_API_KEY' })
     return

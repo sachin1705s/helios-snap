@@ -6,6 +6,7 @@ A local React + Vite app to connect to the Reactor Helios model, stream video in
 
 - Node.js 18+
 - Reactor API key
+- Gemini API key
 
 ## Setup
 
@@ -21,10 +22,11 @@ npm install
 cp .env.local.example .env.local
 ```
 
-3. Add your API key:
+3. Add your API keys:
 
 ```
 VITE_REACTOR_API_KEY=rk_your_api_key_here
+VITE_GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
 4. Start the dev server:
