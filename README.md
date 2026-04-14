@@ -1,12 +1,16 @@
-# Helios Console (Reactor)
+# Helios Snap
 
-A local React + Vite app to connect to the Reactor Helios model, stream video in real time, and control prompts on chunk boundaries.
+A fresh React + Vite rebuild of the app around the documented Reactor JavaScript SDK `2.9.0` flow.
 
-## Requirements
+What this version does:
 
-- Node.js 18+
-- Reactor API key
-- Gemini API key
+- loads a Reactor API key from `.env.local` or a browser override
+- fetches a Reactor session token from `https://api.reactor.inc/tokens`
+- connects to the `helios` model with `ReactorProvider`
+- lets you capture a camera snapshot or upload an image
+- sends the full selected image as `image_b64`
+- sends `set_image`, `set_prompt`, and `start`
+- shows model messages, WebRTC stats, and basic playback controls
 
 ## Setup
 
@@ -16,28 +20,26 @@ A local React + Vite app to connect to the Reactor Helios model, stream video in
 npm install
 ```
 
-2. Create `.env.local` in the project root:
+2. Create your local env file:
 
 ```bash
 cp .env.local.example .env.local
 ```
 
-3. Add your API keys:
+3. Add your Reactor API key:
 
-```
+```env
 VITE_REACTOR_API_KEY=rk_your_api_key_here
-VITE_GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
-4. Start the dev server:
+4. Start the app:
 
 ```bash
-npm run dev
+npm run dev -- --host 0.0.0.0
 ```
-
-Open the printed local URL in your browser.
 
 ## Notes
 
-- The app uses `fetchInsecureJwtToken` on the client. For production, fetch tokens server-side.
-- Helios runs in 33-frame chunks. Prompt changes apply at the next chunk boundary.
+- This rebuild keeps the `2.9.0` SDK and currently sends the selected image directly as `image_b64` without extra compression so the raw image path can be tested in isolation.
+- The app mints tokens directly from the browser for local testing. For production, move key handling server-side.
+- If you previously had a Gemini-based flow in this project, that is intentionally not part of this rebuild. This version is a Reactor-first Helios playground.

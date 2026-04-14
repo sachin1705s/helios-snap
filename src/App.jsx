@@ -1,67 +1,110 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactorProvider,
   ReactorView,
   useReactor,
   useReactorMessage,
+  useStats,
 } from '@reactor-team/js-sdk'
 import './App.css'
 
-const ANIMATE_PROMPT = 'animate it'
-const GEMINI_MODEL = 'gemini-2.5-flash-image'
-
-function compressCanvasToJpeg(canvas, maxBytes = 64 * 1024) {
-  let quality = 0.9
-  let dataUrl = canvas.toDataURL('image/jpeg', quality)
-  let byteSize = Math.ceil((dataUrl.length * 3) / 4)
-
-  while (byteSize > maxBytes && quality > 0.4) {
-    quality -= 0.1
-    dataUrl = canvas.toDataURL('image/jpeg', quality)
-    byteSize = Math.ceil((dataUrl.length * 3) / 4)
-  }
-
-  if (byteSize > maxBytes) {
-    const scale = Math.sqrt(maxBytes / byteSize)
-    const nextCanvas = document.createElement('canvas')
-    nextCanvas.width = Math.max(1, Math.round(canvas.width * scale))
-    nextCanvas.height = Math.max(1, Math.round(canvas.height * scale))
-    const ctx = nextCanvas.getContext('2d')
-    if (!ctx) return { dataUrl, byteSize, width: canvas.width, height: canvas.height }
-    ctx.drawImage(canvas, 0, 0, nextCanvas.width, nextCanvas.height)
-    quality = 0.8
-    dataUrl = nextCanvas.toDataURL('image/jpeg', quality)
-    byteSize = Math.ceil((dataUrl.length * 3) / 4)
-    return {
-      dataUrl,
-      byteSize,
-      width: nextCanvas.width,
-      height: nextCanvas.height,
-    }
-  }
-
-  return { dataUrl, byteSize, width: canvas.width, height: canvas.height }
+const DEFAULT_PROMPT =
+  'A faithful image-to-video shot of the uploaded reference image. Preserve the subject, composition, colors, and camera framing while adding subtle cinematic motion, gentle parallax, soft environmental movement, and smooth temporal consistency.'
+const REACTOR_API_URL = 'https://api.reactor.inc'
+const STORAGE_KEYS = {
+  reactorApiKey: 'helios-snap.reactor-api-key',
 }
 
-async function dataUrlToImage(dataUrl) {
-  const img = new Image()
-  img.src = dataUrl
-  await new Promise((resolve, reject) => {
-    img.onload = resolve
-    img.onerror = reject
+function readStoredApiKey() {
+  if (typeof window === 'undefined') return ''
+  return window.localStorage.getItem(STORAGE_KEYS.reactorApiKey) || ''
+}
+
+async function readErrorMessage(response, fallbackMessage) {
+  const contentType = response.headers.get('content-type') || ''
+
+  if (contentType.includes('application/json')) {
+    const payload = await response.json().catch(() => null)
+    if (payload?.error) return payload.error
+  }
+
+  const text = await response.text().catch(() => '')
+  return text || fallbackMessage
+}
+
+async function fetchReactorJwt(apiKey) {
+  const response = await fetch(`${REACTOR_API_URL}/tokens`, {
+    method: 'POST',
+    headers: {
+      'Reactor-API-Key': apiKey,
+    },
   })
-  return img
+
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `Token request failed (${response.status})`)
+    )
+  }
+
+  const data = await response.json()
+  if (!data?.jwt) {
+    throw new Error('Token response did not include a jwt.')
+  }
+
+  return data.jwt
 }
 
-async function dataUrlToBlob(dataUrl) {
-  const response = await fetch(dataUrl)
-  return response.blob()
+function captureFrameAsBlob(video) {
+  const canvas = document.createElement('canvas')
+  canvas.width = video.videoWidth
+  canvas.height = video.videoHeight
+
+  const context = canvas.getContext('2d')
+  if (!context) {
+    throw new Error('Could not prepare the camera snapshot.')
+  }
+
+  context.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          reject(new Error('Snapshot capture failed.'))
+          return
+        }
+        resolve(blob)
+      },
+      'image/jpeg',
+      0.92
+    )
+  })
 }
 
-function HeliosSnap({ jwtToken, heliosImageFile, onProgress, onError }) {
-  const { status, connect, disconnect, sendCommand, uploadFile, lastError } = useReactor(
+function summarize(value) {
+  try {
+    const text = typeof value === 'string' ? value : JSON.stringify(value)
+    return text.length > 220 ? `${text.slice(0, 220)}…` : text
+  } catch {
+    return 'Unavailable'
+  }
+}
+
+function formatBlobInfo(blob) {
+  if (!blob) return 'No prepared image yet'
+  return `${blob.type || 'image/*'} • ${Math.round(blob.size / 1024)} KB`
+}
+
+function formatFileRefInfo(fileRef) {
+  if (!fileRef) return 'No upload yet'
+  return `${fileRef.name || 'upload'} • ${Math.round((fileRef.size || 0) / 1024)} KB`
+}
+
+function HeliosStudio({ snapshot, onProgress, onError }) {
+  const { status, tracks, connect, disconnect, sendCommand, uploadFile, lastError } = useReactor(
     (state) => ({
       status: state.status,
+      tracks: state.tracks,
       connect: state.connect,
       disconnect: state.disconnect,
       sendCommand: state.sendCommand,
@@ -69,561 +112,695 @@ function HeliosSnap({ jwtToken, heliosImageFile, onProgress, onError }) {
       lastError: state.lastError,
     })
   )
-
+  const stats = useStats()
   const videoShellRef = useRef(null)
+  const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
+  const [flowStep, setFlowStep] = useState('Waiting for an image')
+  const [modelState, setModelState] = useState(null)
+  const [lastEvent, setLastEvent] = useState('No model events yet')
+  const [lastMessage, setLastMessage] = useState('No model messages yet')
+  const [lastPreparedImage, setLastPreparedImage] = useState(null)
+  const [lastUpload, setLastUpload] = useState(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
-  const lastAnimatedRef = useRef(null)
-  const disconnectTimerRef = useRef(null)
-  const pendingImageRef = useRef(null)
-  const inFlightRef = useRef(false)
-  const waitForImageSetRef = useRef(null)
+  const [isWorking, setIsWorking] = useState(false)
+  const pendingEventResolversRef = useRef([])
 
-  useReactorMessage((msg) => {
-    if (!msg || typeof msg !== 'object') return
-    if (msg.type === 'event' && msg.data?.event === 'image_set') {
-      if (waitForImageSetRef.current) {
-        waitForImageSetRef.current()
-        waitForImageSetRef.current = null
+  useReactorMessage((message) => {
+    setLastMessage(summarize(message))
+
+    if (message?.type === 'state') {
+      setModelState(message.data)
+    }
+
+    if (message?.type === 'event') {
+      setLastEvent(summarize(message.data))
+
+      const resolvers = pendingEventResolversRef.current
+      if (resolvers.length) {
+        pendingEventResolversRef.current = resolvers.filter((entry) => {
+          if (entry.predicate(message.data)) {
+            entry.resolve(message.data)
+            return false
+          }
+
+          return true
+        })
       }
     }
   })
-  const [recorder, setRecorder] = useState(null)
-  const [isRecording, setIsRecording] = useState(false)
-  const [recordingError, setRecordingError] = useState('')
-  const [downloadUrl, setDownloadUrl] = useState('')
 
-  const handleConnect = async () => {
-    if (!jwtToken) return
-    await connect(jwtToken)
-  }
+  const waitForModelEvent = useCallback((predicate, timeoutMs = 10000) => {
+    return new Promise((resolve, reject) => {
+      const entry = {
+        predicate,
+        resolve,
+      }
 
-  const clearDisconnectTimer = () => {
-    if (disconnectTimerRef.current) {
-      window.clearTimeout(disconnectTimerRef.current)
-      disconnectTimerRef.current = null
-    }
-  }
+      pendingEventResolversRef.current.push(entry)
 
-  const handleAnimate = useCallback(async () => {
-    if (!pendingImageRef.current) {
-      onError?.('Upload an image first.')
-      return
-    }
-    if (status !== 'ready') {
-      onError?.('Connect Helios and wait for Ready.')
-      return
-    }
-    if (inFlightRef.current) return
-    inFlightRef.current = true
-    onError?.('')
-    onProgress?.('Preparing stream...')
-    try {
-      await sendCommand('reset')
-      await sendCommand('schedule_prompt', { prompt: ANIMATE_PROMPT, chunk: 0 })
-      const imageRef = await uploadFile(pendingImageRef.current, { name: 'helios-frame.jpg' })
-      await sendCommand('set_image', {
-        image: imageRef,
-        transition: 'cut',
-      })
-      await new Promise((resolve) => {
-        waitForImageSetRef.current = resolve
-        window.setTimeout(() => {
-          if (waitForImageSetRef.current === resolve) {
-            waitForImageSetRef.current = null
-            resolve()
-          }
-        }, 1500)
-      })
-      onProgress?.('Starting stream...')
-      await sendCommand('start')
-      // Re-apply image shortly after start to reinforce conditioning.
       window.setTimeout(() => {
-        if (pendingImageRef.current && status === 'ready') {
-          sendCommand('set_image', {
-            image: imageRef,
-            transition: 'cut',
-          })
-        }
-      }, 1200)
-      onProgress?.('Streaming (60s)...')
-      clearDisconnectTimer()
-      disconnectTimerRef.current = window.setTimeout(() => {
-        disconnect()
-        onProgress?.('Disconnected.')
-      }, 60000)
-    } catch (err) {
-      onError?.(err?.message || 'Failed to animate.')
-    } finally {
-      inFlightRef.current = false
-    }
-  }, [disconnect, onError, onProgress, sendCommand, status, uploadFile])
+        const stillPending = pendingEventResolversRef.current.includes(entry)
+        if (!stillPending) return
+
+        pendingEventResolversRef.current = pendingEventResolversRef.current.filter(
+          (candidate) => candidate !== entry
+        )
+        reject(new Error('Timed out waiting for Helios to confirm the reference image.'))
+      }, timeoutMs)
+    })
+  }, [])
 
   useEffect(() => {
-    if (!heliosImageFile) return
-    if (lastAnimatedRef.current === heliosImageFile) return
-    lastAnimatedRef.current = heliosImageFile
-    pendingImageRef.current = heliosImageFile
-    if (status === 'ready') {
-      handleAnimate()
-    }
-  }, [handleAnimate, heliosImageFile, status])
-
-  useEffect(() => {
-    if (status === 'ready' && pendingImageRef.current) {
-      handleAnimate()
-    }
-  }, [handleAnimate, status])
+    if (!snapshot) return
+    setFlowStep('Image ready')
+  }, [snapshot])
 
   useEffect(() => {
     const handleFullscreenChange = () => {
       setIsFullscreen(Boolean(document.fullscreenElement))
     }
+
     document.addEventListener('fullscreenchange', handleFullscreenChange)
     return () => {
       document.removeEventListener('fullscreenchange', handleFullscreenChange)
     }
   }, [])
 
-  useEffect(() => {
+  const trackSummary = useMemo(() => {
+    const trackNames = Object.keys(tracks || {})
+    return trackNames.length ? trackNames.join(', ') : 'No tracks yet'
+  }, [tracks])
+
+  const runHelios = useCallback(async () => {
+    if (!snapshot?.blob) {
+      onError('Capture or upload an image first.')
+      setFlowStep('Waiting for an image')
+      return
+    }
+
+    if (!prompt.trim()) {
+      onError('Add a prompt before starting Helios.')
+      return
+    }
+
     if (status === 'disconnected') {
-      clearDisconnectTimer()
+      onProgress('Connecting to Helios...')
+      onError('')
+      setFlowStep('Connecting')
+      try {
+        await connect()
+      } catch (error) {
+        onError(error?.message || 'Failed to reconnect to Helios.')
+        setFlowStep('Connection failed')
+      }
+      return
     }
-  }, [status])
 
-  useEffect(() => {
-    return () => {
-      clearDisconnectTimer()
+    if (status !== 'ready') {
+      onProgress('Waiting for Helios to become ready...')
+      setFlowStep('Waiting for ready')
+      return
     }
-  }, [])
 
-  useEffect(() => {
-    return () => {
-      if (downloadUrl) URL.revokeObjectURL(downloadUrl)
+    setIsWorking(true)
+    onError('')
+
+    try {
+      setFlowStep('Resetting model')
+      onProgress('Resetting Helios...')
+      await sendCommand('reset', {})
+
+      setFlowStep('Preparing image')
+      onProgress('Preparing the reference image for Helios...')
+      const preparedBlob = snapshot.blob
+      setLastPreparedImage(preparedBlob)
+
+      setFlowStep('Uploading image')
+      onProgress('Uploading the reference image to Reactor...')
+      const imageRef = await uploadFile(preparedBlob, {
+        name: snapshot.name || 'helios-reference',
+      })
+      setLastUpload(imageRef)
+
+      setFlowStep('Setting image')
+      onProgress('Sending the reference image to Helios...')
+      await sendCommand('set_image', { image: imageRef, transition: 'cut' })
+
+      setFlowStep('Confirming image')
+      onProgress('Waiting for Helios to confirm the reference image...')
+      await waitForModelEvent((event) => event?.event === 'image_set')
+
+      setFlowStep('Scheduling prompt')
+      onProgress('Scheduling the prompt for chunk 0...')
+      await sendCommand('schedule_prompt', { prompt: prompt.trim(), chunk: 0 })
+
+      setFlowStep('Starting stream')
+      await sendCommand('start', {})
+      setFlowStep('Streaming')
+      onProgress('Helios is streaming.')
+    } catch (error) {
+      setFlowStep('Action failed')
+      onError(error?.message || 'Failed to start Helios.')
+    } finally {
+      setIsWorking(false)
     }
-  }, [downloadUrl])
+  }, [connect, onError, onProgress, prompt, sendCommand, snapshot, status, uploadFile, waitForModelEvent])
 
-  const toggleFullscreen = async () => {
+  const pauseGeneration = useCallback(async () => {
+    try {
+      setFlowStep('Pausing')
+      await sendCommand('pause', {})
+      onProgress('Generation paused.')
+    } catch (error) {
+      onError(error?.message || 'Failed to pause Helios.')
+    }
+  }, [onError, onProgress, sendCommand])
+
+  const resumeGeneration = useCallback(async () => {
+    try {
+      setFlowStep('Resuming')
+      await sendCommand('resume', {})
+      onProgress('Generation resumed.')
+    } catch (error) {
+      onError(error?.message || 'Failed to resume Helios.')
+    }
+  }, [onError, onProgress, sendCommand])
+
+  const resetGeneration = useCallback(async () => {
+    try {
+      setFlowStep('Resetting model')
+      await sendCommand('reset', {})
+      onProgress('Helios reset.')
+    } catch (error) {
+      onError(error?.message || 'Failed to reset Helios.')
+    }
+  }, [onError, onProgress, sendCommand])
+
+  const clearReferenceImage = useCallback(async () => {
+    try {
+      setFlowStep('Clearing image')
+      await sendCommand('clear_image', {})
+      onProgress('Reference image cleared.')
+    } catch (error) {
+      onError(error?.message || 'Failed to clear the image.')
+    }
+  }, [onError, onProgress, sendCommand])
+
+  const toggleFullscreen = useCallback(async () => {
     const shell = videoShellRef.current
     if (!shell) return
+
     if (document.fullscreenElement) {
       await document.exitFullscreen()
       return
     }
-    if (shell.requestFullscreen) {
-      await shell.requestFullscreen()
-    } else if (shell.webkitRequestFullscreen) {
-      shell.webkitRequestFullscreen()
-    }
-  }
 
-  const getVideoElement = () => {
-    if (!videoShellRef.current) return null
-    return videoShellRef.current.querySelector('video')
-  }
+    await shell.requestFullscreen()
+  }, [])
 
-  const startRecording = () => {
-    setRecordingError('')
-    const videoElement = getVideoElement()
-    if (!videoElement) {
-      setRecordingError('Video stream not ready.')
-      return
-    }
-    const stream = videoElement.captureStream?.() || videoElement.mozCaptureStream?.()
-    if (!stream) {
-      setRecordingError('Recording not supported in this browser.')
-      return
-    }
-    try {
-      const options = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-        ? { mimeType: 'video/webm;codecs=vp9' }
-        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
-          ? { mimeType: 'video/webm;codecs=vp8' }
-          : { mimeType: 'video/webm' }
-      const mediaRecorder = new MediaRecorder(stream, options)
-      const chunks = []
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) chunks.push(event.data)
-      }
-      mediaRecorder.onstop = () => {
-        if (downloadUrl) URL.revokeObjectURL(downloadUrl)
-        const blob = new Blob(chunks, { type: 'video/webm' })
-        const url = URL.createObjectURL(blob)
-        setDownloadUrl(url)
-      }
-      mediaRecorder.start(1000)
-      setRecorder(mediaRecorder)
-      setIsRecording(true)
-    } catch (err) {
-      setRecordingError(err?.message || 'Failed to start recording.')
-    }
-  }
+  const modelStateSummary = modelState
+    ? `running=${modelState.running} • paused=${modelState.paused} • chunk=${modelState.current_chunk} • frame=${modelState.current_frame}`
+    : 'Waiting for model state'
 
-  const stopRecording = () => {
-    if (!recorder) return
-    if (recorder.state !== 'inactive') recorder.stop()
-    setIsRecording(false)
-  }
-
-  const downloadRecording = () => {
-    if (!downloadUrl) return
-    const link = document.createElement('a')
-    link.href = downloadUrl
-    link.download = `helios-recording-${Date.now()}.webm`
-    link.click()
-  }
+  const statsSummary = stats
+    ? `fps ${stats.framesPerSecond ?? 'n/a'} • rtt ${stats.rtt ?? 'n/a'} • candidate ${stats.candidateType ?? 'n/a'}`
+    : 'Waiting for WebRTC stats'
 
   return (
-    <div className="stream-panel">
-      <div className="stream-header">
-        <div className={`status-dot status-${status}`} />
-        <span className="status-text">{status}</span>
+    <div className="studio-shell">
+      <div className="studio-meta">
+        <div className="status-pill">
+          <span className={`status-dot status-${status}`} />
+          <span>{status}</span>
+        </div>
+        <div className="status-pill subtle">Flow: {flowStep}</div>
+        <div className="status-pill subtle">Tracks: {trackSummary}</div>
       </div>
-      <div
-        className={`video-shell ${isFullscreen ? 'fullscreen' : ''}`}
-        ref={videoShellRef}
-      >
-        <ReactorView className="video" videoObjectFit="cover" muted />
-        <div className="visualizer">
-          {Array.from({ length: 22 }).map((_, index) => (
-            <span
-              key={index}
-              className="bar"
-              style={{ animationDelay: `${index * 0.08}s` }}
+
+      <div className="studio-grid">
+        <div className="stream-card">
+          <div className="panel-header">
+            <div>
+              <h2>Helios Stream</h2>
+              <p>Built on the documented Reactor `2.9.0` React flow.</p>
+            </div>
+            <button className="btn ghost compact" onClick={toggleFullscreen}>
+              {isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
+            </button>
+          </div>
+
+          <div className={`video-shell ${isFullscreen ? 'fullscreen' : ''}`} ref={videoShellRef}>
+            <ReactorView className="video" videoObjectFit="cover" muted />
+            {!snapshot ? (
+              <div className="camera-empty overlay-copy">
+                Upload or capture an image, then start Helios.
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="controls-card">
+          <div className="panel-header">
+            <div>
+              <h2>Prompt + Controls</h2>
+              <p>Upload the image, send the prompt, then start generation.</p>
+            </div>
+          </div>
+
+          <label className="field">
+            <span className="label">Prompt</span>
+            <textarea
+              className="text-area"
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
+              rows={6}
+              placeholder="Describe the motion you want Helios to create."
             />
-          ))}
+          </label>
+
+          <div className="button-row">
+            <button className="btn primary" onClick={() => void runHelios()} disabled={isWorking || !snapshot}>
+              {isWorking ? 'Working...' : 'Start From Snapshot'}
+            </button>
+            <button className="btn ghost" onClick={() => void pauseGeneration()} disabled={status !== 'ready' || !modelState?.running || modelState?.paused}>
+              Pause
+            </button>
+            <button className="btn ghost" onClick={() => void resumeGeneration()} disabled={status !== 'ready' || !modelState?.paused}>
+              Resume
+            </button>
+          </div>
+
+          <div className="button-row">
+            <button className="btn ghost" onClick={() => void resetGeneration()} disabled={status !== 'ready'}>
+              Reset
+            </button>
+            <button className="btn ghost" onClick={() => void clearReferenceImage()} disabled={status !== 'ready'}>
+              Clear Image
+            </button>
+            <button className="btn ghost" onClick={() => void disconnect()} disabled={status === 'disconnected'}>
+              Disconnect
+            </button>
+            <button className="btn ghost" onClick={() => void connect()} disabled={status !== 'disconnected'}>
+              Reconnect
+            </button>
+          </div>
+
+          <div className="meta-grid">
+            <div className="meta-card">
+              <strong>Model State</strong>
+              <span>{modelStateSummary}</span>
+            </div>
+            <div className="meta-card">
+              <strong>Prepared Image</strong>
+              <span>{formatBlobInfo(lastPreparedImage)}</span>
+            </div>
+            <div className="meta-card">
+              <strong>Last Upload</strong>
+              <span>{formatFileRefInfo(lastUpload)}</span>
+            </div>
+            <div className="meta-card">
+              <strong>Stats</strong>
+              <span>{statsSummary}</span>
+            </div>
+            <div className="meta-card">
+              <strong>Last Event</strong>
+              <span>{lastEvent}</span>
+            </div>
+            <div className="meta-card wide">
+              <strong>Last Message</strong>
+              <span>{lastMessage}</span>
+            </div>
+            {lastError ? (
+              <div className="meta-card wide danger">
+                <strong>SDK Error</strong>
+                <span>
+                  {lastError.code}: {lastError.message}
+                </span>
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
-      <div className="button-row">
-        <button
-          className="btn primary"
-          onClick={handleConnect}
-          disabled={status !== 'disconnected' || !jwtToken}
-        >
-          Connect
-        </button>
-        <button
-          className="btn ghost"
-          onClick={() => disconnect()}
-          disabled={status === 'disconnected'}
-        >
-          Disconnect
-        </button>
-        <button className="btn ghost" onClick={toggleFullscreen}>
-          {isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
-        </button>
-      </div>
-      <div className="record-row">
-        <button
-          className={`btn ${isRecording ? 'danger' : ''}`}
-          onClick={isRecording ? stopRecording : startRecording}
-          disabled={status === 'disconnected'}
-        >
-          {isRecording ? 'Stop Recording' : 'Record'}
-        </button>
-        <button className="btn ghost" onClick={downloadRecording} disabled={!downloadUrl}>
-          Save
-        </button>
-        <span className="muted">{isRecording ? 'Recording...' : 'Ready to record.'}</span>
-      </div>
-      {recordingError ? <div className="error-card">{recordingError}</div> : null}
-      {lastError ? (
-        <div className="error-card">
-          {lastError.code}: {lastError.message}
-        </div>
-      ) : null}
     </div>
   )
 }
 
 function App() {
-  const envApiKey = import.meta.env.VITE_REACTOR_API_KEY
-  const geminiKey = import.meta.env.VITE_GEMINI_API_KEY
-  const isDev = import.meta.env.DEV
-  const [jwtToken, setJwtToken] = useState(null)
+  const envApiKey = import.meta.env.VITE_REACTOR_API_KEY || ''
+  const storedApiKey = readStoredApiKey()
+  const initialApiKey = storedApiKey || envApiKey
+  const [apiKeyDraft, setApiKeyDraft] = useState('')
+  const [activeApiKey, setActiveApiKey] = useState(initialApiKey)
+  const [jwtToken, setJwtToken] = useState('')
+  const [isFetchingToken, setIsFetchingToken] = useState(Boolean(initialApiKey))
   const [tokenError, setTokenError] = useState('')
-  const [ghibliPreview, setGhibliPreview] = useState('')
-  const [heliosImageFile, setHeliosImageFile] = useState(null)
   const [progress, setProgress] = useState('')
   const [error, setError] = useState('')
+  const [snapshot, setSnapshot] = useState(null)
   const [cameraOn, setCameraOn] = useState(false)
   const [cameraError, setCameraError] = useState('')
+  const [showApiKeyInput, setShowApiKeyInput] = useState(!initialApiKey)
+  const [tokenRequestNonce, setTokenRequestNonce] = useState(0)
   const cameraVideoRef = useRef(null)
   const cameraStreamRef = useRef(null)
 
-  const missingLocalReactorKey = isDev && !envApiKey
-
   useEffect(() => {
-    const useClientKey = isDev && envApiKey
-    if (missingLocalReactorKey) {
-      return
-    }
+    if (!activeApiKey) return
+
     let cancelled = false
-    const endpoint = useClientKey ? '/reactor/tokens' : '/api/token'
-    const headers = useClientKey ? { 'Reactor-API-Key': envApiKey } : undefined
-    fetch(endpoint, {
-      method: 'POST',
-      headers,
-    })
-      .then(async (response) => {
-        if (!response.ok) {
-          throw new Error(`Token request failed (${response.status})`)
-        }
-        const data = await response.json()
-        if (!data?.jwt) {
-          throw new Error('Token response missing jwt')
-        }
-        if (!cancelled) {
-          setTokenError('')
-          setJwtToken(data.jwt)
-        }
+
+    fetchReactorJwt(activeApiKey)
+      .then((jwt) => {
+        if (cancelled) return
+        setJwtToken(jwt)
+        setTokenError('')
       })
       .catch((fetchError) => {
-        if (!cancelled) setTokenError(fetchError?.message || 'Failed to fetch token')
+        if (cancelled) return
+        setTokenError(fetchError?.message || 'Failed to fetch a Reactor session token.')
       })
+      .finally(() => {
+        if (!cancelled) {
+          setIsFetchingToken(false)
+        }
+      })
+
     return () => {
       cancelled = true
     }
-  }, [envApiKey, isDev, missingLocalReactorKey])
-
-  const generateGhibli = useCallback(
-    async (imageDataUrl) => {
-      if (!geminiKey) {
-        setError('Add your Gemini API key to generate the Ghibli frame.')
-        return
-      }
-
-      setError('')
-      setProgress('Generating Ghibli frame...')
-
-      const base64 = imageDataUrl.replace(/^data:image\/[^;]+;base64,/, '')
-      const mimeTypeMatch = imageDataUrl.match(/^data:(image\/[^;]+);base64,/) || []
-      const mimeType = mimeTypeMatch[1] || 'image/jpeg'
-
-      const prompt =
-        'Transform this image into a Studio Ghibli-inspired illustration. Soft pastel colors, hand-painted look, gentle lighting, clean line work, whimsical but faithful to the subject. Return a single full-frame image.'
-
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': geminiKey,
-          },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  { text: prompt },
-                  {
-                    inline_data: {
-                      mime_type: mimeType,
-                      data: base64,
-                    },
-                  },
-                ],
-              },
-            ],
-            generationConfig: {
-              imageConfig: {
-                aspectRatio: '4:3',
-                imageSize: '1K',
-              },
-            },
-          }),
-        }
-      )
-
-      if (!response.ok) {
-        throw new Error(`Gemini error (${response.status})`)
-      }
-
-      const data = await response.json()
-      const parts =
-        data?.candidates?.[0]?.content?.parts ||
-        data?.candidates?.[0]?.content?.parts ||
-        []
-      const imagePart = parts.find((part) => part.inline_data || part.inlineData)
-      const inlineData = imagePart?.inline_data || imagePart?.inlineData
-
-      if (!inlineData?.data) {
-        throw new Error('No image returned from Gemini.')
-      }
-
-      const ghibliDataUrl = `data:${inlineData.mime_type || 'image/png'};base64,${inlineData.data}`
-      setGhibliPreview(ghibliDataUrl)
-
-      const img = await dataUrlToImage(ghibliDataUrl)
-      const maxWidth = 640
-      const maxHeight = 384
-      const scale = Math.min(1, maxWidth / img.width, maxHeight / img.height)
-      const canvas = document.createElement('canvas')
-      canvas.width = Math.max(1, Math.round(img.width * scale))
-      canvas.height = Math.max(1, Math.round(img.height * scale))
-      const ctx = canvas.getContext('2d')
-      if (!ctx) throw new Error('Failed to prepare image for Helios.')
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
-
-      const { dataUrl: heliosDataUrl } = compressCanvasToJpeg(canvas)
-      const heliosBlob = await dataUrlToBlob(heliosDataUrl)
-      setHeliosImageFile(heliosBlob)
-      setProgress('Ghibli frame ready.')
-    },
-    [geminiKey]
-  )
-
-  const handleFileChange = async (event) => {
-    const file = event.target.files?.[0]
-    if (!file) return
-    setGhibliPreview('')
-    setHeliosImageFile(null)
-    try {
-      const fileDataUrl = await new Promise((resolve, reject) => {
-        const reader = new FileReader()
-        reader.onload = () => resolve(reader.result)
-        reader.onerror = reject
-        reader.readAsDataURL(file)
-      })
-
-      if (typeof fileDataUrl !== 'string') {
-        setError('Failed to read image file.')
-        setProgress('')
-        return
-      }
-
-      await generateGhibli(fileDataUrl)
-    } catch (err) {
-      setError(err?.message || 'Failed to generate Ghibli frame.')
-      setProgress('')
-    }
-  }
+  }, [activeApiKey, tokenRequestNonce])
 
   useEffect(() => {
     return () => {
       if (cameraStreamRef.current) {
         cameraStreamRef.current.getTracks().forEach((track) => track.stop())
       }
+
+      if (snapshot?.url) {
+        URL.revokeObjectURL(snapshot.url)
+      }
     }
+  }, [snapshot])
+
+  const replaceSnapshot = useCallback((blob, name, label) => {
+    setSnapshot((current) => {
+      if (current?.url) {
+        URL.revokeObjectURL(current.url)
+      }
+
+      return {
+        blob,
+        name,
+        label,
+        url: URL.createObjectURL(blob),
+      }
+    })
+    setProgress('Snapshot ready. Start Helios when you are ready.')
+    setError('')
   }, [])
 
-  const startCamera = async () => {
+  const handleApiKeySubmit = useCallback(
+    (event) => {
+      event.preventDefault()
+      const trimmedKey = apiKeyDraft.trim()
+
+      if (!trimmedKey) {
+        setError('Paste a Reactor API key or keep using the env key.')
+        return
+      }
+
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem(STORAGE_KEYS.reactorApiKey, trimmedKey)
+      }
+
+      setProgress('Refreshing the Reactor session token...')
+      setError('')
+      setJwtToken('')
+      setTokenError('')
+      setIsFetchingToken(true)
+      setActiveApiKey(trimmedKey)
+      setTokenRequestNonce((current) => current + 1)
+      setShowApiKeyInput(false)
+      setApiKeyDraft('')
+    },
+    [apiKeyDraft]
+  )
+
+  const clearBrowserKey = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(STORAGE_KEYS.reactorApiKey)
+    }
+
+    setApiKeyDraft('')
+    setJwtToken('')
+    setTokenError('')
+    setError('')
+    setProgress(envApiKey ? 'Switched back to the env key.' : '')
+    setActiveApiKey(envApiKey)
+    setIsFetchingToken(Boolean(envApiKey))
+    setTokenRequestNonce((current) => current + 1)
+    setShowApiKeyInput(!envApiKey)
+  }, [envApiKey])
+
+  const startCamera = useCallback(async () => {
     setCameraError('')
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' },
+        video: {
+          facingMode: 'environment',
+        },
         audio: false,
       })
+
       cameraStreamRef.current = stream
+
       if (cameraVideoRef.current) {
         cameraVideoRef.current.srcObject = stream
         await cameraVideoRef.current.play()
       }
-      setCameraOn(true)
-    } catch (err) {
-      setCameraError(err?.message || 'Unable to access camera.')
-      setCameraOn(false)
-    }
-  }
 
-  const stopCamera = () => {
+      setCameraOn(true)
+    } catch (cameraIssue) {
+      setCameraOn(false)
+      setCameraError(cameraIssue?.message || 'Camera access was blocked.')
+    }
+  }, [])
+
+  const stopCamera = useCallback(() => {
     if (cameraStreamRef.current) {
       cameraStreamRef.current.getTracks().forEach((track) => track.stop())
       cameraStreamRef.current = null
     }
+
     if (cameraVideoRef.current) {
       cameraVideoRef.current.srcObject = null
     }
-    setCameraOn(false)
-  }
 
-  const captureFromCamera = async () => {
-    if (!cameraVideoRef.current) return
+    setCameraOn(false)
+  }, [])
+
+  const captureFromCamera = useCallback(async () => {
+    if (!cameraVideoRef.current || !cameraOn) return
+
     const video = cameraVideoRef.current
-    if (video.videoWidth === 0 || video.videoHeight === 0) return
-    const canvas = document.createElement('canvas')
-    canvas.width = video.videoWidth
-    canvas.height = video.videoHeight
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.9)
-    setGhibliPreview('')
-    setHeliosImageFile(null)
-    await generateGhibli(dataUrl)
-  }
+    if (!video.videoWidth || !video.videoHeight) {
+      setCameraError('Camera is still waking up. Try again in a moment.')
+      return
+    }
+
+    try {
+      const blob = await captureFrameAsBlob(video)
+      replaceSnapshot(blob, `camera-snapshot-${Date.now()}.jpg`, 'Live camera snapshot')
+    } catch (captureError) {
+      setCameraError(captureError?.message || 'Failed to capture the snapshot.')
+    }
+  }, [cameraOn, replaceSnapshot])
+
+  const handleFileChange = useCallback(
+    (event) => {
+      const file = event.target.files?.[0]
+      event.target.value = ''
+      if (!file) return
+
+      replaceSnapshot(file, file.name || `upload-${Date.now()}.jpg`, 'Uploaded image')
+    },
+    [replaceSnapshot]
+  )
+
+  const tokenReady = Boolean(jwtToken)
+  const hasBrowserOverride = Boolean(activeApiKey) && activeApiKey !== envApiKey
+  const keyStatus = activeApiKey
+    ? hasBrowserOverride
+      ? 'Using the browser override key.'
+      : 'Using VITE_REACTOR_API_KEY from .env.local.'
+    : 'No key loaded yet.'
 
   return (
     <div className="app">
+      <div className="background-glow glow-one" />
+      <div className="background-glow glow-two" />
+
       <header className="hero">
+        <div className="hero-badge">Rebuilt For Reactor JS SDK 2.9.0</div>
         <h1>Helios Snap</h1>
+        <p>
+          A clean-from-scratch Helios playground that follows the documented React SDK flow:
+          connect, upload a file, set the reference image, send the prompt, and start the stream.
+        </p>
       </header>
 
-      <section className="panel inputs">
-        <div className="steps">
-          <h2>Steps</h2>
-          <ol>
-            <li>Upload or capture a photo.</li>
-            <li>Connect Helios and wait for ready.</li>
-            <li>Watch the 25s animation or record it.</li>
-          </ol>
+      <section className="panel auth-panel">
+        <div className="panel-header">
+          <div>
+            <h2>Session Setup</h2>
+            <p>Use the env key from `.env.local`, or temporarily override it in the browser.</p>
+          </div>
+          <div className="status-pill subtle">{keyStatus}</div>
         </div>
-        {missingLocalReactorKey ? (
-          <div className="error-card">Missing VITE_REACTOR_API_KEY.</div>
-        ) : null}
-        {!geminiKey ? (
-          <div className="error-card">Missing VITE_GEMINI_API_KEY.</div>
-        ) : null}
+
+        <div className="status-strip">
+          <span className="status-pill subtle">
+            {activeApiKey
+              ? isFetchingToken
+                ? 'Minting a Reactor session token...'
+                : tokenReady
+                  ? 'Session token ready.'
+                  : 'Waiting for a valid token.'
+              : 'Add a Reactor key to begin.'}
+          </span>
+          <span className="status-pill subtle">API URL: {REACTOR_API_URL}</span>
+        </div>
+
+        {showApiKeyInput ? (
+          <form className="api-key-form" onSubmit={handleApiKeySubmit}>
+            <label className="field">
+              <span className="label">Reactor API Key</span>
+              <input
+                className="text-input"
+                type="password"
+                value={apiKeyDraft}
+                onChange={(event) => setApiKeyDraft(event.target.value)}
+                placeholder="rk_your_api_key"
+                autoComplete="off"
+                spellCheck="false"
+              />
+            </label>
+
+            <div className="button-row">
+              <button className="btn primary" type="submit">
+                Use Browser Key
+              </button>
+              <button
+                className="btn ghost"
+                type="button"
+                onClick={() => setShowApiKeyInput(false)}
+                disabled={!envApiKey && !hasBrowserOverride}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className="button-row">
+            <button className="btn ghost" onClick={() => setShowApiKeyInput(true)}>
+              {activeApiKey ? 'Override Key' : 'Add Key'}
+            </button>
+            <button className="btn ghost" onClick={clearBrowserKey} disabled={!hasBrowserOverride && !envApiKey}>
+              Reset Key Source
+            </button>
+          </div>
+        )}
+
         {tokenError ? <div className="error-card">{tokenError}</div> : null}
         {progress ? <div className="status-line">{progress}</div> : null}
         {error ? <div className="error-card">{error}</div> : null}
       </section>
 
-      <div className="stage">
-        <section className="panel capture-panel">
-          <div className="upload">
-            <input className="file" type="file" accept="image/*" onChange={handleFileChange} />
+      <section className="capture-grid">
+        <div className="panel capture-panel">
+          <div className="panel-header">
+            <div>
+              <h2>Capture</h2>
+              <p>Use the camera or upload a file for Helios image-to-video.</p>
+            </div>
+            <div className="status-pill subtle">{cameraOn ? 'Camera live' : 'Camera off'}</div>
           </div>
+
           <div className="camera-shell">
             <video ref={cameraVideoRef} className="camera-feed" muted playsInline />
-            {!cameraOn ? <div className="camera-empty">Camera off</div> : null}
+            {!cameraOn ? (
+              <div className="camera-empty">
+                <div>
+                  <strong>Ready for a new image</strong>
+                  <span>Open the camera or upload a still image.</span>
+                </div>
+              </div>
+            ) : null}
+            <div className="viewfinder" />
           </div>
+
           <div className="button-row">
             <button className="btn ghost" onClick={cameraOn ? stopCamera : startCamera}>
-              {cameraOn ? 'Stop Camera' : 'Use Camera'}
+              {cameraOn ? 'Stop Camera' : 'Open Camera'}
             </button>
-            <button className="btn primary" onClick={captureFromCamera} disabled={!cameraOn}>
-              Capture
+            <button className="btn primary" onClick={() => void captureFromCamera()} disabled={!cameraOn}>
+              Capture Snapshot
             </button>
           </div>
+
+          <label className="field">
+            <span className="label">Upload Image</span>
+            <input className="file-input" type="file" accept="image/*" onChange={handleFileChange} />
+          </label>
+
           {cameraError ? <div className="error-card">{cameraError}</div> : null}
-        </section>
+        </div>
 
-        <section className="panel ghibli-panel">
-          {ghibliPreview ? (
-            <img src={ghibliPreview} alt="Ghibli" />
+        <div className="panel preview-panel">
+          <div className="panel-header">
+            <div>
+              <h2>Preview</h2>
+              <p>{snapshot?.label || 'No image selected yet'}</p>
+            </div>
+            <div className="status-pill subtle">
+              {snapshot ? snapshot.name : 'Waiting for a snapshot'}
+            </div>
+          </div>
+
+          {snapshot ? (
+            <div className="snapshot-frame">
+              <img src={snapshot.url} alt={snapshot.label} />
+            </div>
           ) : (
-            <div className="empty">Ghibli frame</div>
+            <div className="empty-state">
+              <strong>No snapshot yet</strong>
+              <span>The selected image will show up here before you send it to Helios.</span>
+            </div>
           )}
-        </section>
-      </div>
+        </div>
+      </section>
 
-      <section className="panel stream-panel large">
-        {!jwtToken ? (
-          <div className="muted">Fetching Reactor token...</div>
-        ) : (
+      <section className="panel stream-shell">
+        {tokenReady ? (
           <ReactorProvider
+            key={jwtToken}
+            apiUrl={REACTOR_API_URL}
             modelName="helios"
-            apiUrl="/reactor"
             jwtToken={jwtToken}
             connectOptions={{ autoConnect: true }}
           >
-            <HeliosSnap
-              jwtToken={jwtToken}
-              heliosImageFile={heliosImageFile}
-              onProgress={(msg) => setProgress(msg || '')}
-              onError={(msg) => setError(msg || '')}
+            <HeliosStudio
+              snapshot={snapshot}
+              onProgress={(message) => setProgress(message || '')}
+              onError={(message) => setError(message || '')}
             />
           </ReactorProvider>
+        ) : (
+          <div className="empty-state large">
+            <strong>Helios is waiting for a token</strong>
+            <span>Load a Reactor key, wait for the session token, then start the stream.</span>
+          </div>
         )}
       </section>
     </div>
